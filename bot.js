@@ -1,6 +1,12 @@
+require("./uptime");
 const { Telegraf } = require("telegraf");
 const express = require("express");
 const { Pool } = require("pg");
+const OpenAI = require("openai");
+const ms = require("ms");
+
+// the newest OpenAI model is "gpt-5" which was released August 7, 2025. do not change this unless explicitly requested by the user
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
@@ -77,10 +83,18 @@ const bot = new Telegraf(process.env.BOT_TOKEN);
 let botActive = true;
 
 const ADMIN_ID = parseInt(process.env.ADMIN_ID) || 0;
+let users = new Set();
 
 function isAdmin(ctx) {
     return ctx.from.id === ADMIN_ID;
 }
+
+bot.use((ctx, next) => {
+    if (ctx.from && ctx.from.id) {
+        users.add(ctx.from.id);
+    }
+    return next();
+});
 
 const commands = {
     start: "Start the bot",
@@ -131,6 +145,13 @@ const commands = {
     kick: "Kick a user (Admin only)",
     listbanned: "List banned users (Admin only)",
     poweron: "Check if bot is running (Admin only)",
+    stats: "Bot stats (Admin only)",
+    clear: "Delete last 5 messages (Admin only)",
+    trt: "Translate message to English (reply to msg)",
+    short: "Shorten a URL",
+    tagall: "Tag everyone (Admin only)",
+    mute: "Timed mute (e.g., /mute 10m) (Admin only)",
+    unmute: "Unmute a user (Admin only, reply to msg)",
     animeclips: "Get anime clips link"
 };
 
@@ -199,12 +220,29 @@ bot.command("rate", ctx => {
     const t = ctx.message.text.replace("/rate ", "");
     ctx.reply(`⭐ I rate *${t}* — ${Math.floor(Math.random()*10)}/10`);
 });
-bot.command("ask", ctx => ctx.reply("🤔 " + ["Yes", "No", "Maybe", "Definitely"][Math.floor(Math.random()*4)]));
+bot.command("ask", async (ctx) => {
+    const question = ctx.message.text.replace("/ask ", "").trim();
+    if (!question || question === "/ask") {
+        return ctx.reply("❓ Please provide a question. Example: /ask What is the meaning of life?");
+    }
+    
+    try {
+        const response = await openai.chat.completions.create({
+            model: "gpt-5",
+            messages: [{ role: "user", content: question }],
+        });
+        ctx.reply(response.choices[0].message.content);
+    } catch (err) {
+        console.error("OpenAI error:", err);
+        ctx.reply("⚠️ Sorry, I couldn't process your question. Please try again later.");
+    }
+});
 bot.command("secret", ctx => ctx.reply("🤫 Secret: You are awesome. Don't tell anyone."));
 
-bot.command("active", async (ctx) => {
-    const count = await getActiveUserCount();
-    ctx.reply(`🌟 Active users: ${count}`);
+bot.command("active", (ctx) => {
+    const activeUsers = Array.from(users).join("\n");
+    if (activeUsers.length === 0) return ctx.reply("❌ No active users.");
+    ctx.reply(`👥 Active users:\n${activeUsers}`);
 });
 
 bot.command("shutdown", (ctx) => {
@@ -261,6 +299,129 @@ bot.command("poweron", (ctx) => {
     if (!isAdmin(ctx)) return ctx.reply("❌ You are not authorized.");
     botActive = true;
     ctx.reply("⚡ Bot is now ON ✅");
+});
+
+bot.command("stats", async (ctx) => {
+    if (!isAdmin(ctx)) return ctx.reply("❌ You are not authorized.");
+    const count = await getActiveUserCount();
+    ctx.reply(`📊 BOT STATS\nUsers: ${count}\nStatus: ${botActive ? "ON" : "OFF"}`);
+});
+
+bot.command("clear", async (ctx) => {
+    if (!isAdmin(ctx)) return;
+    const chatId = ctx.chat.id;
+    for (let i = 0; i < 5; i++) {
+        try {
+            await ctx.telegram.deleteMessage(chatId, ctx.message.message_id - i);
+        } catch {}
+    }
+});
+
+bot.command("trt", async (ctx) => {
+    if (!ctx.message.reply_to_message) {
+        return ctx.reply("❌ Reply to a message to translate it.");
+    }
+
+    const originalText = ctx.message.reply_to_message.text;
+
+    if (!originalText) {
+        return ctx.reply("❌ That message has no text to translate.");
+    }
+
+    try {
+        const response = await openai.chat.completions.create({
+            model: "gpt-5",
+            messages: [
+                {
+                    role: "system",
+                    content: "Translate the following text to English. Only return the translation."
+                },
+                {
+                    role: "user",
+                    content: originalText
+                }
+            ],
+            max_completion_tokens: 200
+        });
+
+        const translated = response.choices[0].message.content.trim();
+
+        ctx.reply(`🇬🇧 *Translation:*\n${translated}`, {
+            parse_mode: "Markdown"
+        });
+
+    } catch (err) {
+        console.error("Translate error:", err);
+        ctx.reply("⚠️ Translation failed.");
+    }
+});
+
+bot.command("short", (ctx) => {
+    const url = ctx.message.text.split(" ")[1];
+    if (!url) return ctx.reply("❌ Usage: /short https://example.com");
+    ctx.reply(`🔗 Shortened:\nhttps://tinyurl.com/api-create.php?url=${url}`);
+});
+
+bot.command("tagall", (ctx) => {
+    if (!isAdmin(ctx)) return;
+    ctx.reply("📣 @everyone");
+});
+
+bot.command("mute", async (ctx) => {
+    if (!isAdmin(ctx)) return ctx.reply("❌ Admin only");
+
+    if (!ctx.message.reply_to_message)
+        return ctx.reply("❌ Reply to a user to mute");
+
+    const userId = ctx.message.reply_to_message.from.id;
+    const muteTime = ctx.message.text.split(" ")[1];
+
+    if (!muteTime || isNaN(ms(muteTime))) {
+        return ctx.reply("❌ Usage: /mute [duration] (e.g., /mute 10m)");
+    }
+
+    try {
+        await ctx.telegram.restrictChatMember(ctx.chat.id, userId, {
+            permissions: { can_send_messages: false }
+        });
+
+        ctx.reply(`🔇 User muted for ${muteTime}`);
+
+        setTimeout(async () => {
+            await ctx.telegram.restrictChatMember(ctx.chat.id, userId, {
+                permissions: { can_send_messages: true }
+            });
+            ctx.reply(`🔊 User unmuted after ${muteTime}`);
+        }, ms(muteTime));
+    } catch (err) {
+        console.error("Mute error:", err);
+        ctx.reply("❌ Failed to mute user");
+    }
+});
+
+bot.command("unmute", async (ctx) => {
+    if (!isAdmin(ctx)) return ctx.reply("❌ Admin only");
+
+    if (!ctx.message.reply_to_message)
+        return ctx.reply("❌ Reply to the user you want to unmute");
+
+    const userId = ctx.message.reply_to_message.from.id;
+
+    try {
+        await ctx.telegram.restrictChatMember(ctx.chat.id, userId, {
+            permissions: {
+                can_send_messages: true,
+                can_send_media_messages: true,
+                can_send_polls: true,
+                can_send_other_messages: true,
+                can_add_web_page_previews: true
+            }
+        });
+        ctx.reply("🔊 User unmuted");
+    } catch (err) {
+        console.error("Unmute error:", err);
+        ctx.reply("❌ Failed to unmute user");
+    }
 });
 
 bot.command("animeclips", (ctx) => {
